@@ -1,0 +1,33 @@
+﻿# Core LLM framework
+langchain
+langchain-core
+langchain-community
+langchain-text-splitters
+langgraph
+
+# LLM providers
+langchain-groq
+langchain-mistralai
+
+# Local embeddings and vector search
+langchain-huggingface
+sentence-transformers
+faiss-cpu
+pypdf
+
+# Persistent graph memory
+langgraph-checkpoint-sqlite
+
+# Backend API
+fastapi
+uvicorn[standard]
+argon2-cffi>=23.1,<26
+
+# Frontend
+streamlit
+requests
+
+# Configuration and testing
+python-dotenv
+pytest
+httpx

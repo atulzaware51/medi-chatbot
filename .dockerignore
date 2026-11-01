@@ -1,0 +1,28 @@
+﻿# Git and secrets
+.git
+.env
+.env.*
+!.env.example
+
+# Python
+.venv
+venv
+__pycache__
+.pytest_cache
+*.pyc
+
+# Local application data
+data/raw
+vectorstore
+*.sqlite*
+*.db
+*.log
+
+# Frontend
+frontend/node_modules
+frontend/dist
+
+# Local development
+.vscode
+.idea
+.security-backup-*

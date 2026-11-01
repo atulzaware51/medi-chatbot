@@ -1,0 +1,44 @@
+﻿# Python environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local data and vector indexes
+data/raw/*
+!data/raw/.gitkeep
+vectorstore/*
+!vectorstore/.gitkeep
+
+# Local application files
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.log
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+# Medibot secrets and local configuration
+*.pem
+*.key
+*.p12
+*.pfx
+# Python environments and caches
+.coverage
+htmlcov/
+# Local databases, vector indexes, and logs
+vectorstore/
+data/raw/
+# Local backups
+.security-backup-*/

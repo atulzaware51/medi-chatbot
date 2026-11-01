@@ -1,0 +1,520 @@
+"""Admin API for uploading and automatically indexing Medibot resources."""
+
+import ipaddress
+import json
+import logging
+import os
+import re
+import shutil
+import tempfile
+import threading
+from pathlib import Path
+from typing import Annotated
+
+from dotenv import load_dotenv
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+    status,
+)
+from pypdf.errors import PdfReadError
+
+# Resolve the project root and load configuration.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env", override=False)
+
+from app.ingestion.chunking import split_documents
+from app.ingestion.document_loader import load_document, load_documents
+from app.rag.vector_store import create_vector_store
+
+logger = logging.getLogger(__name__)
+
+
+def require_local_admin(request: Request) -> None:
+    """Allow admin requests only when the ASGI peer address is loopback."""
+    client = request.client
+
+    if client is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin resources are available only from this machine.",
+        )
+
+    try:
+        is_loopback = ipaddress.ip_address(client.host).is_loopback
+    except (TypeError, ValueError):
+        is_loopback = False
+
+    if not is_loopback:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin resources are available only from this machine.",
+        )
+
+
+router = APIRouter(
+    prefix="/admin/resources",
+    tags=["Admin Resources"],
+    dependencies=[Depends(require_local_admin)],
+)
+
+# Resolve paths from the project root so the API works from any directory.
+DATA_DIR = (
+    PROJECT_ROOT / os.getenv("DATA_DIR", "data/raw")
+).resolve()
+
+_index_setting = Path(
+    os.getenv("VECTORSTORE_DIR", "vectorstore/faiss_index")
+)
+INDEX_DIR = (
+    _index_setting
+    if _index_setting.is_absolute()
+    else PROJECT_ROOT / _index_setting
+).resolve()
+# Stores indexing status so it survives page refreshes and restarts.
+STATUS_FILE = INDEX_DIR.parent / "resource_index_status.json"
+INDEX_FAILURE_MESSAGE = (
+    "The resource could not be indexed. "
+    "Any existing knowledge index was preserved."
+)
+
+
+def read_index_status() -> dict:
+    """Read the status manifest without exposing malformed manifest data."""
+    try:
+        manifest = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+    return manifest if isinstance(manifest, dict) else {}
+
+
+def write_index_status(manifest: dict) -> None:
+    """Persist an index manifest using an atomic same-directory replace."""
+    STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp_status = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=STATUS_FILE.parent,
+            prefix=".resource-index-status-",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_status = Path(temp_file.name)
+            json.dump(manifest, temp_file, indent=2)
+
+        temp_status.replace(STATUS_FILE)
+        temp_status = None
+    finally:
+        if temp_status is not None:
+            temp_status.unlink(missing_ok=True)
+
+
+def save_index_status(chunks: list, documents: list) -> None:
+    """Persist successful indexing status and chunk counts."""
+    resources = {}
+
+    # Count indexed chunks by their source filename.
+    for chunk in chunks:
+        source = chunk.metadata.get("source")
+        if source:
+            resources.setdefault(source, 0)
+            resources[source] += 1
+
+    write_index_status(
+        {
+            "index": {"status": "ready", "error": None},
+            "resources": {
+                filename: {"status": "indexed", "chunks": count}
+                for filename, count in resources.items()
+            },
+            "total_chunks": len(chunks),
+            "documents_or_pages_loaded": len(documents),
+        }
+    )
+
+
+def set_index_state(
+    state: str,
+    *,
+    filename: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Record a safe, user-facing indexing state."""
+    manifest = read_index_status()
+    resources = manifest.get("resources")
+    if not isinstance(resources, dict):
+        resources = {}
+        manifest["resources"] = resources
+
+    if state == "building" and filename:
+        resources[filename] = {"status": "pending", "chunks": None}
+    elif state == "failed" and filename:
+        resources.pop(filename, None)
+
+    manifest["index"] = {
+        "status": state,
+        "error": error,
+    }
+    write_index_status(manifest)
+
+
+def index_details(manifest: dict) -> dict[str, str | bool | None]:
+    """Return a safe summary of current and last-known index readiness."""
+    available = (
+        (INDEX_DIR / "index.faiss").is_file()
+        and (INDEX_DIR / "index.pkl").is_file()
+    )
+    index = manifest.get("index")
+    state = index.get("status") if isinstance(index, dict) else None
+    if not isinstance(state, str) or state not in {
+        "building",
+        "failed",
+        "ready",
+    }:
+        state = "ready" if available else "not_ready"
+    elif state == "ready" and not available:
+        state = "not_ready"
+
+    messages = {
+        "building": "The knowledge index is being rebuilt.",
+        "failed": INDEX_FAILURE_MESSAGE,
+        "ready": "The knowledge index is ready.",
+        "not_ready": "No searchable knowledge index is available yet.",
+    }
+
+    return {
+        "status": state,
+        "available": available,
+        "message": messages[state],
+    }
+ALLOWED_EXTENSIONS = {".pdf", ".txt"}
+MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB
+
+# Prevent two uploads from rebuilding/swapping the index simultaneously.
+INDEX_LOCK = threading.Lock()
+
+
+def ensure_data_dir() -> None:
+    """Create the resource directory if it does not exist."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def resource_details(path: Path) -> dict:
+    """Return safe metadata about a resource."""
+    return {
+        "name": path.name,
+        "extension": path.suffix.lower(),
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def rebuild_index(uploaded_filename: str) -> dict:
+    """
+    Rebuild the index using all available resources.
+
+    The new FAISS index is built in a separate directory. The existing
+    index is backed up before replacement and restored if replacement fails.
+    """
+    INDEX_DIR.parent.mkdir(parents=True, exist_ok=True)
+
+    # Temporary directories are placed beside the index to keep the
+    # replacement on the same drive/filesystem.
+    build_parent = Path(
+        tempfile.mkdtemp(
+            prefix=".medibot-index-build-",
+            dir=INDEX_DIR.parent,
+        )
+    )
+
+    staged_index = build_parent / "faiss_index"
+    backup_index = build_parent / "previous_index"
+
+    old_index_moved = False
+    new_index_installed = False
+
+    try:
+        documents = load_documents(DATA_DIR)
+        chunks = split_documents(
+            documents,
+            chunk_size=800,
+            chunk_overlap=120,
+        )
+        uploaded_chunks = [
+            chunk
+            for chunk in chunks
+            if chunk.metadata.get("source") == uploaded_filename
+        ]
+
+        if not uploaded_chunks:
+            raise ValueError(
+                "No searchable text chunks were extracted from the upload."
+            )
+
+        create_vector_store(chunks, staged_index)
+
+        if not (staged_index / "index.faiss").is_file():
+            raise RuntimeError("The staged FAISS index is incomplete.")
+
+        if not (staged_index / "index.pkl").is_file():
+            raise RuntimeError("The staged FAISS metadata is incomplete.")
+
+        if INDEX_DIR.exists():
+            INDEX_DIR.replace(backup_index)
+            old_index_moved = True
+
+        staged_index.replace(INDEX_DIR)
+        new_index_installed = True
+
+        # Keep the previous index available until status persistence succeeds.
+        save_index_status(chunks, documents)
+
+        if backup_index.exists():
+            try:
+                shutil.rmtree(backup_index)
+                old_index_moved = False
+            except OSError:
+                logger.warning("Could not remove the temporary previous index.")
+
+        logger.info("Resource indexing completed successfully.")
+        return {
+            "status": "indexed",
+            "filename": uploaded_filename,
+            "chunks_created": len(uploaded_chunks),
+            "total_chunks_in_index": len(chunks),
+            "documents_or_pages_loaded": len(documents),
+        }
+
+    except Exception:
+        if new_index_installed and INDEX_DIR.exists():
+            INDEX_DIR.replace(staged_index)
+            new_index_installed = False
+
+        if old_index_moved and backup_index.exists():
+            backup_index.replace(INDEX_DIR)
+            old_index_moved = False
+
+        raise
+
+    finally:
+        try:
+            shutil.rmtree(build_parent)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Could not remove the temporary index build directory.")
+
+@router.get("/")
+def list_resources() -> dict:
+    """List resources with their persistent indexing status."""
+    ensure_data_dir()
+    manifest = read_index_status()
+    indexed_resources = manifest.get("resources")
+    if not isinstance(indexed_resources, dict):
+        indexed_resources = {}
+
+    resources = []
+
+    for path in sorted(DATA_DIR.iterdir()):
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.suffix.lower() not in ALLOWED_EXTENSIONS
+        ):
+            continue
+
+        details = resource_details(path)
+        indexing = indexed_resources.get(path.name)
+        if not isinstance(indexing, dict):
+            indexing = {}
+
+        resource_status = indexing.get("status")
+        if not isinstance(resource_status, str) or resource_status not in {
+            "indexed",
+            "pending",
+            "failed",
+        }:
+            resource_status = "not_indexed"
+
+        chunks = indexing.get("chunks")
+        if not isinstance(chunks, int) or chunks < 0:
+            chunks = None
+
+        details["index_status"] = resource_status
+        details["chunks"] = chunks
+
+        resources.append(details)
+
+    return {
+        "count": len(resources),
+        "resources": resources,
+        "index": index_details(manifest),
+    }
+
+@router.post("/upload", status_code=status.HTTP_201_CREATED)
+def upload_resource(
+    file: Annotated[UploadFile, File(...)],
+) -> dict:
+    """Save a resource, index it automatically, and report the result."""
+    original_name = file.filename or ""
+
+    if (
+        not original_name
+        or len(original_name) > 255
+        or "/" in original_name
+        or "\\" in original_name
+        or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in original_name
+        )
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="A valid filename without path components is required.",
+        )
+
+    suffix = Path(original_name).suffix.lower()
+
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail="Upload only PDF or TXT files.",
+        )
+
+    # Sanitize the filename to prevent path traversal.
+    safe_stem = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        Path(original_name).stem,
+    ).strip("._-")[:100]
+
+    if not safe_stem:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid filename.",
+        )
+
+    destination = DATA_DIR / f"{safe_stem}{suffix}"
+
+    temp_path = None
+    total_bytes = 0
+    uploaded_and_saved = False
+
+    try:
+        with INDEX_LOCK:
+            ensure_data_dir()
+
+            if destination.exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail="A resource with this filename already exists.",
+                )
+
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=DATA_DIR,
+                prefix=".upload_",
+                suffix=suffix,
+                delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+
+                while True:
+                    block = file.file.read(1024 * 1024)
+                    if not block:
+                        break
+
+                    total_bytes += len(block)
+                    if total_bytes > MAX_UPLOAD_SIZE:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="File exceeds the 20 MB upload limit.",
+                        )
+
+                    temp_file.write(block)
+
+            if total_bytes == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="The uploaded file is empty.",
+                )
+
+            if suffix == ".pdf":
+                with temp_path.open("rb") as staged_file:
+                    if b"%PDF-" not in staged_file.read(1024):
+                        raise HTTPException(
+                            status_code=422,
+                            detail="The uploaded PDF is not valid.",
+                        )
+
+            try:
+                validated_documents = load_document(temp_path)
+            except (OSError, UnicodeError, ValueError, PdfReadError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The uploaded document could not be read.",
+                ) from exc
+
+            if not validated_documents:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The uploaded document contains no readable text.",
+                )
+
+            if destination.exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail="A resource with this filename already exists.",
+                )
+
+            temp_path.replace(destination)
+            temp_path = None
+            uploaded_and_saved = True
+
+            set_index_state("building", filename=destination.name)
+            result = rebuild_index(destination.name)
+
+        return {
+            "message": "Resource uploaded and indexed successfully.",
+            "resource": resource_details(destination),
+            "indexing": result,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        if uploaded_and_saved:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("Could not remove the failed resource upload.")
+
+        try:
+            set_index_state(
+                "failed",
+                filename=destination.name,
+                error=INDEX_FAILURE_MESSAGE,
+            )
+        except OSError:
+            logger.exception("Could not persist failed indexing status.")
+
+        logger.exception("Resource upload or indexing failed.")
+
+        raise HTTPException(
+            status_code=500,
+            detail=INDEX_FAILURE_MESSAGE,
+        ) from exc
+
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+        file.file.close()
