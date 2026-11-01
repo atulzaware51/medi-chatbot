@@ -21,8 +21,7 @@ or personalized treatment decisions.
 - Loopback-only admin resource access by default.
 
 ## Architecture
-
- <img width="2024" height="769" alt="medi-chatbot drawio" src="https://github.com/user-attachments/assets/ab663479-8812-41de-b94b-d63c239f920f" />
+<img width="8176" height="3156" alt="image" src="https://github.com/user-attachments/assets/7953154b-fded-43ec-8dcd-024ffd3e237e" />
 
 The FAISS document index, account/conversation database, and LangGraph
 checkpointer are distinct stores. Conversation ownership is enforced by the
