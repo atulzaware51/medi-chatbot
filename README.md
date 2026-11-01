@@ -22,59 +22,7 @@ or personalized treatment decisions.
 
 ## Architecture
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor User
-    participant UI as React/Vite UI
-    participant API as FastAPI Chat API
-    participant DB as Auth and Conversation SQLite
-    participant Graph as LangGraph Workflow
-    participant Checkpoint as LangGraph SQLite Checkpointer
-    participant RAG as RAG Answer Service
-    participant FAISS as Local FAISS Index
-    participant Embed as Sentence Transformers
-    participant LLM as Configured Groq Chat Model
-
-    User->>UI: Submit a question
-    Note over User,DB: User signs in; the UI sends the bearer token from sessionStorage
-    opt First question in a new conversation
-        UI->>API: POST /api/chat/conversations/
-        API->>DB: Create conversation for authenticated user
-        DB-->>API: New conversation ID
-        API-->>UI: Conversation details
-    end
-    UI->>API: POST /api/chat/ (question, thread_id, bearer token)
-    API->>DB: Authenticate user and verify conversation ownership
-    DB-->>API: Authenticated user and owned conversation
-    API->>Graph: Run graph with question and thread_id
-    Graph->>Checkpoint: Load thread state and prior messages
-    Checkpoint-->>Graph: Previous messages for this conversation
-    Graph->>RAG: Answer question with conversation history
-
-    alt Emergency phrase or deterministic memory response
-        RAG-->>Graph: Return response without retrieval or LLM
-    else Retrieve evidence
-        RAG->>FAISS: Similarity search (default top 4 chunks)
-        FAISS->>Embed: Embed query with cached local model
-        Embed-->>FAISS: Query embedding
-        FAISS-->>RAG: Matching chunks and source metadata
-        alt Evidence is insufficient for a medical question
-            RAG-->>Graph: Return evidence-limitation response
-        else Evidence or conversational context can answer
-            RAG->>LLM: Send safety prompt, history, and retrieved passages
-            LLM-->>RAG: Generate answer
-            RAG-->>Graph: Return answer and validated source references
-        end
-    end
-
-    Graph->>Checkpoint: Save updated conversation state
-    Graph-->>API: Return answer and sources
-    API->>DB: Persist user/assistant messages and sources
-    DB-->>API: Exchange saved
-    API-->>UI: Return answer and source references
-    UI-->>User: Display answer and citations
-```
+ <img width="2024" height="769" alt="medi-chatbot drawio" src="https://github.com/user-attachments/assets/ab663479-8812-41de-b94b-d63c239f920f" />
 
 The FAISS document index, account/conversation database, and LangGraph
 checkpointer are distinct stores. Conversation ownership is enforced by the
