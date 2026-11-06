@@ -56,6 +56,8 @@ def retrieve_documents(
         k=k,
     )
 
+    # FAISS returns nearest candidates first; discard weak matches rather than
+    # padding the answer context up to k with irrelevant passages.
     return [
         document
         for document, score in scored_documents
@@ -79,6 +81,7 @@ def search_knowledge_base(
 
     results = []
 
+    # Preserve the retrieval order so citation labels follow relevance rank.
     for rank, document in enumerate(documents, start=1):
         results.append(
             {

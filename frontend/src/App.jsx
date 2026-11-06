@@ -1,10 +1,7 @@
-
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 
-// Import the admin dashboard from its actual folder.
 import AdminResources from './admin/AdminResources'
-import AdminLogin from './admin/AdminLogin'
 import AuthPanel from './AuthPanel'
 
 // Display source documents attached to an assistant response.
@@ -90,74 +87,114 @@ function Message({ message }) {
 }
 
 export default function App() {
-  // Track which page is currently visible: chatbot or admin dashboard.
   const [activeView, setActiveView] = useState(
-    window.location.pathname === '/admin' ? 'admin' : 'chat'
+    () => (typeof window !== 'undefined' && window.location.pathname === '/admin' ? 'admin' : 'chat')
   )
-  const [adminToken, setAdminToken] = useState(
-    () => sessionStorage.getItem('medibot_admin_token') || ''
-  )
-  const [accessToken, setAccessToken] = useState(
-    () => sessionStorage.getItem('medibot_access_token') || ''
-  )
-  const [currentUser, setCurrentUser] = useState(null)
-  const [authLoading, setAuthLoading] = useState(
-    () => Boolean(sessionStorage.getItem('medibot_access_token'))
-  )
+  const [account, setAccount] = useState(null)
+  const [csrfToken, setCsrfToken] = useState('')
+  const [authLoading, setAuthLoading] = useState(true)
   const [conversations, setConversations] = useState([])
-  const [threadId, setThreadId] = useState(null)
-  const [question, setQuestion] = useState('')
+  const [conversationId, setConversationId] = useState(null)
   const [messages, setMessages] = useState([])
+  const [question, setQuestion] = useState('')
   const [loading, setLoading] = useState(false)
+  const [historyLoading, setHistoryLoading] = useState(false)
   const [error, setError] = useState('')
+  const requestControllerRef = useRef(null)
+  const messagesEndRef = useRef(null)
 
-  const clearAuth = useCallback(() => {
-    sessionStorage.removeItem('medibot_access_token')
-    setAccessToken('')
-    setCurrentUser(null)
-    setConversations([])
-    setThreadId(null)
-    setMessages([])
-    setAuthLoading(false)
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [loading, messages])
+
+  useEffect(
+    () => () => requestControllerRef.current?.abort(),
+    [],
+  )
+
+  const fetchConversation = useCallback(async (id) => {
+    const response = await fetch(`/api/chat/conversations/${encodeURIComponent(id)}`)
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      throw new Error(
+        typeof data.detail === 'string'
+          ? data.detail
+          : `Could not restore conversation (HTTP ${response.status}).`,
+      )
+    }
+    setConversationId(data.id)
+    setMessages(Array.isArray(data.messages) ? data.messages : [])
   }, [])
 
-  const handleAuthenticated = useCallback((data) => {
-    sessionStorage.setItem('medibot_access_token', data.access_token)
-    setCurrentUser(data.user)
-    setAccessToken(data.access_token)
-    setAuthLoading(true)
-  }, [])
+  const fetchConversationList = useCallback(async (restoreSelection = true) => {
+    const response = await fetch('/api/chat/conversations')
+    const data = await response.json().catch(() => [])
+    if (!response.ok) {
+      throw new Error(
+        typeof data.detail === 'string'
+          ? data.detail
+          : `Could not load chat history (HTTP ${response.status}).`,
+      )
+    }
 
-  const handleUserLogout = useCallback(async () => {
-    const token = accessToken
-    if (!token) {
-      clearAuth()
+    const items = Array.isArray(data) ? data : []
+    setConversations(items)
+    if (!restoreSelection || !items.length) {
+      setConversationId(null)
+      setMessages([])
       return
     }
 
+    await fetchConversation(items[0].id)
+  }, [fetchConversation])
+
+  async function handleAuthenticated(user) {
+    setAccount(user.email)
+    setCsrfToken(user.csrf_token)
+    setAuthLoading(true)
+    setError('')
     try {
-      const response = await fetch('/api/auth/logout', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-      })
-      if (!response.ok) {
-        throw new Error(`Logout failed (HTTP ${response.status}).`)
-      }
-      clearAuth()
-    } catch (logoutError) {
-      setError(
-        logoutError instanceof Error
-          ? logoutError.message
-          : 'Could not revoke the current session. Please try again.',
-      )
+      await fetchConversationList()
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : 'Could not load chat history.')
+    } finally {
+      setAuthLoading(false)
     }
-  }, [accessToken, clearAuth])
+  }
+
+  useEffect(() => {
+    let active = true
+    async function restoreSession() {
+      try {
+        const response = await fetch('/api/auth/me')
+        if (!response.ok) return
+        const user = await response.json()
+        if (!active) return
+        setAccount(user.email)
+        setCsrfToken(user.csrf_token)
+        try {
+          await fetchConversationList()
+        } catch (loadError) {
+          if (active) {
+            setError(loadError instanceof Error ? loadError.message : 'Could not load chat history.')
+          }
+        }
+      } catch {
+        if (active) setError('Unable to connect to Medibot. Please retry.')
+      } finally {
+        if (active) setAuthLoading(false)
+      }
+    }
+    restoreSession()
+    return () => {
+      active = false
+    }
+  }, [fetchConversationList])
 
   function navigateTo(path, view) {
     if (window.location.pathname !== path) {
       window.history.pushState({}, '', path)
     }
-
     setActiveView(view)
   }
 
@@ -172,211 +209,62 @@ export default function App() {
   useEffect(() => {
     function syncViewWithLocation() {
       setActiveView(
-        window.location.pathname === '/admin' ? 'admin' : 'chat',
+        window.location.pathname === '/admin' ? 'admin' : 'chat'
       )
     }
 
+    // Keep the selected view in sync when the user navigates with browser back/forward.
     window.addEventListener('popstate', syncViewWithLocation)
     return () => window.removeEventListener('popstate', syncViewWithLocation)
   }, [])
 
-  const handleAdminLogout = useCallback(() => {
-    sessionStorage.removeItem('medibot_admin_token')
-    setAdminToken('')
-  }, [])
-
-  function handleAdminLogin(token) {
-    sessionStorage.setItem('medibot_admin_token', token)
-    setAdminToken(token)
-  }
-
-  useEffect(() => {
-    if (!accessToken) return undefined
-
-    let active = true
-    const headers = { Authorization: `Bearer ${accessToken}` }
-
-    async function restoreAccount() {
-      setAuthLoading(true)
-      try {
-        const userResponse = await fetch('/api/auth/me', { headers })
-        if (!userResponse.ok) {
-          if (userResponse.status === 401) clearAuth()
-          throw new Error('Your session is invalid or has expired. Please sign in again.')
-        }
-
-        const user = await userResponse.json()
-        const conversationResponse = await fetch('/api/chat/conversations/', { headers })
-        if (!conversationResponse.ok) {
-          throw new Error(`Could not load conversation history (HTTP ${conversationResponse.status}).`)
-        }
-
-        const savedConversations = await conversationResponse.json()
-        if (!active) return
-
-        setCurrentUser(user)
-        setConversations(savedConversations)
-        if (savedConversations.length > 0) {
-          const mostRecent = savedConversations[0]
-          const messagesResponse = await fetch(
-            `/api/chat/conversations/${encodeURIComponent(mostRecent.id)}/messages`,
-            { headers },
-          )
-          if (!messagesResponse.ok) {
-            throw new Error(`Could not restore conversation (HTTP ${messagesResponse.status}).`)
-          }
-          const savedMessages = await messagesResponse.json()
-          if (!active) return
-          setThreadId(mostRecent.id)
-          setMessages(savedMessages)
-        } else {
-          setThreadId(null)
-          setMessages([])
-        }
-      } catch (restoreError) {
-        if (active) {
-          setError(
-            restoreError instanceof Error
-              ? restoreError.message
-              : 'Could not restore your account.',
-          )
-        }
-      } finally {
-        if (active) setAuthLoading(false)
-      }
-    }
-
-    restoreAccount()
-    return () => {
-      active = false
-    }
-  }, [accessToken, clearAuth])
-
-  async function openConversation(conversationId) {
-    if (!accessToken) return
-
-    setError('')
-    try {
-      const response = await fetch(
-        `/api/chat/conversations/${encodeURIComponent(conversationId)}/messages`,
-        { headers: { Authorization: `Bearer ${accessToken}` } },
-      )
-      if (response.status === 401) {
-        clearAuth()
-        throw new Error('Your session has expired. Please sign in again.')
-      }
-      if (!response.ok) {
-        throw new Error(`Could not open conversation (HTTP ${response.status}).`)
-      }
-
-      setThreadId(conversationId)
-      setMessages(await response.json())
-    } catch (openError) {
-      setError(
-        openError instanceof Error
-          ? openError.message
-          : 'Could not open conversation.',
-      )
-    }
-  }
-
-  async function deleteConversation(conversationId) {
-    if (!window.confirm('Delete this conversation and its saved messages?')) {
-      return
-    }
-
-    try {
-      const response = await fetch(
-        `/api/chat/conversations/${encodeURIComponent(conversationId)}`,
-        {
-          method: 'DELETE',
-          headers: { Authorization: `Bearer ${accessToken}` },
-        },
-      )
-      if (response.status === 401) {
-        clearAuth()
-        throw new Error('Your session has expired. Please sign in again.')
-      }
-      if (!response.ok) {
-        throw new Error(`Could not delete conversation (HTTP ${response.status}).`)
-      }
-
-      setConversations((current) => current.filter(
-        (conversation) => conversation.id !== conversationId,
-      ))
-      if (threadId === conversationId) {
-        setThreadId(null)
-        setMessages([])
-      }
-    } catch (deleteError) {
-      setError(
-        deleteError instanceof Error
-          ? deleteError.message
-          : 'Could not delete conversation.',
-      )
-    }
-  }
-
-  // Send the user's question to the existing FastAPI chat endpoint.
   async function handleSubmit(event) {
     event.preventDefault()
 
     const text = question.trim()
 
     // Ignore empty questions and duplicate submissions while loading.
-    if (!text || loading || !accessToken) return
+    if (!text || loading) return
 
     setQuestion('')
     setError('')
 
-    // Show the user's message immediately.
-    setMessages((current) => [
-      ...current,
-      { role: 'user', content: text },
-    ])
-
+    const controller = new AbortController()
+    requestControllerRef.current = controller
     setLoading(true)
 
     try {
-      let activeThreadId = threadId
-      const headers = { Authorization: `Bearer ${accessToken}` }
-
-      if (!activeThreadId) {
-        const createResponse = await fetch('/api/chat/conversations/', {
+      let targetConversationId = conversationId
+      if (!targetConversationId) {
+        const createResponse = await fetch('/api/chat/conversations', {
           method: 'POST',
-          headers,
+          headers: { 'X-CSRF-Token': csrfToken },
         })
         const created = await createResponse.json().catch(() => ({}))
         if (!createResponse.ok) {
-          if (createResponse.status === 401) clearAuth()
-          throw new Error(
-            typeof created.detail === 'string'
-              ? created.detail
-              : `Could not create conversation (HTTP ${createResponse.status}).`,
-          )
+          throw new Error(created.detail || `Could not start a conversation (HTTP ${createResponse.status}).`)
         }
-
-        activeThreadId = created.id
-        setThreadId(activeThreadId)
+        targetConversationId = created.id
+        setConversationId(targetConversationId)
         setConversations((current) => [created, ...current])
       }
 
-      // Vite forwards /api/chat/ to the FastAPI /chat/ endpoint.
-      const response = await fetch('/api/chat/', {
-        method: 'POST',
-        headers: {
-          ...headers,
-          'Content-Type': 'application/json',
+      setMessages((current) => [...current, { role: 'user', content: text }])
+      const response = await fetch(
+        `/api/chat/conversations/${encodeURIComponent(targetConversationId)}/messages`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-CSRF-Token': csrfToken,
+          },
+          signal: controller.signal,
+          body: JSON.stringify({ question: text }),
         },
-        body: JSON.stringify({
-          question: text,
-          thread_id: activeThreadId,
-        }),
-      })
+      )
 
       // Extract a useful error message if the API returns a failure.
       if (!response.ok) {
-        if (response.status === 401) clearAuth()
         let detail = 'Medibot could not process your question.'
 
         try {
@@ -394,8 +282,8 @@ export default function App() {
 
       // Read the assistant answer and any retrieved source references.
       const data = await response.json()
+      if (controller.signal.aborted) return
 
-      // Append the assistant's response without removing earlier messages.
       setMessages((current) => [
         ...current,
         {
@@ -404,18 +292,28 @@ export default function App() {
           sources: Array.isArray(data.sources) ? data.sources : [],
         },
       ])
-      setConversations((current) => current.map((conversation) => (
-        conversation.id === activeThreadId
-          ? {
-            ...conversation,
-            title: conversation.title === 'New conversation'
-              ? text.slice(0, 80)
-              : conversation.title,
-            updated_at: new Date().toISOString(),
-          }
-          : conversation
-      )))
+      setConversations((current) =>
+        current.map((item) =>
+          item.id === targetConversationId
+            ? {
+                ...item,
+                title: item.title === 'New conversation'
+                  ? text.slice(0, 157)
+                  : item.title,
+                updated_at: new Date().toISOString(),
+              }
+            : item,
+        ).sort((first, second) =>
+          new Date(second.updated_at) - new Date(first.updated_at),
+        ),
+      )
     } catch (err) {
+      if (controller.signal.aborted) return
+      setMessages((current) =>
+        current.at(-1)?.role === 'user' && current.at(-1)?.content === text
+          ? current.slice(0, -1)
+          : current,
+      )
       // Show connection and backend errors in the chat interface.
       setError(
         err instanceof Error
@@ -423,30 +321,127 @@ export default function App() {
           : 'Unable to connect to Medibot. Check that the backend is running.',
       )
     } finally {
-      // Always release the loading state after the request finishes.
-      setLoading(false)
+      if (requestControllerRef.current === controller) {
+        requestControllerRef.current = null
+        setLoading(false)
+      }
     }
   }
 
   function startNewConversation() {
-    if (loading) return
+    const request = requestControllerRef.current
+    if (request) {
+      requestControllerRef.current = null
+      request.abort()
+    }
 
-    setThreadId(null)
+    setConversationId(null)
     setMessages([])
     setQuestion('')
     setError('')
+    setLoading(false)
   }
 
-  function handleNewConversation() {
-    openChat()
-    startNewConversation()
+  async function openConversation(conversation) {
+    if (loading || historyLoading) return
+    setHistoryLoading(true)
+    setQuestion('')
+    setError('')
+    try {
+      await fetchConversation(conversation.id)
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : 'Could not restore conversation.')
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
+
+  async function deleteConversation(event, id) {
+    event.stopPropagation()
+    setError('')
+    try {
+      const response = await fetch(`/api/chat/conversations/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        headers: { 'X-CSRF-Token': csrfToken },
+      })
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.detail || `Could not delete conversation (HTTP ${response.status}).`)
+      }
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : 'Could not delete conversation.')
+      return
+    }
+
+    setConversations((current) =>
+      current.filter((conversation) => conversation.id !== id),
+    )
+
+    if (conversationId === id) {
+      setConversationId(null)
+      setMessages([])
+      setQuestion('')
+      setError('')
+    }
+  }
+
+  async function handleLogout() {
+    try {
+      const response = await fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrfToken },
+      })
+      if (!response.ok) throw new Error(`Could not sign out (HTTP ${response.status}).`)
+      setAccount(null)
+      setCsrfToken('')
+      setConversations([])
+      setConversationId(null)
+      setMessages([])
+    } catch (logoutError) {
+      setError(logoutError instanceof Error ? logoutError.message : 'Could not sign out.')
+    }
+  }
+
+  async function handleDeleteAccount() {
+    const password = window.prompt('Enter your password to permanently delete your account and conversations.')
+    if (!password) return
+    if (!window.confirm('Delete your account and all saved conversations? This cannot be undone.')) return
+
+    try {
+      const response = await fetch('/api/auth/me', {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': csrfToken,
+        },
+        body: JSON.stringify({ password }),
+      })
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.detail || `Could not delete account (HTTP ${response.status}).`)
+      }
+      setAccount(null)
+      setCsrfToken('')
+      setConversations([])
+      setConversationId(null)
+      setMessages([])
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : 'Could not delete account.')
+    }
+  }
+
+  if (authLoading) {
+    return <main className="auth-page" role="status">Loading your secure session…</main>
+  }
+  if (!account) {
+    return <AuthPanel onAuthenticated={handleAuthenticated} />
   }
 
   return (
     <main className="app-shell">
       {/* Shared header: visible on both the chatbot and admin pages. */}
       <header className="app-header">
-        <a className="brand" href="/" aria-label="Medibot home">
+        <a className="brand" href="/" aria-label="Medibot home" onClick={(e) => { e.preventDefault(); openChat(); }}>
           <span className="brand-icon" aria-hidden="true">✚</span>
           <span>
             <strong>Medibot</strong>
@@ -455,7 +450,9 @@ export default function App() {
         </a>
 
         <div className="header-actions">
-          {/* Switch to the chatbot without changing the chat implementation. */}
+          <span className="account-label">{account}</span>
+
+          {/* Switch to the chatbot. */}
           <button
             className="new-chat-button"
             type="button"
@@ -465,14 +462,14 @@ export default function App() {
             Chat
           </button>
 
-          {/* Open the resource-management dashboard. */}
+          {/* Open the local admin dashboard directly; remote access requires login. */}
           <button
             className="new-chat-button"
             type="button"
             onClick={openAdmin}
             aria-pressed={activeView === 'admin'}
           >
-            Admin Resources
+            Add Resources
           </button>
 
           {/* Indicate that the application uses the document-grounded API. */}
@@ -480,41 +477,36 @@ export default function App() {
             <span className="status-dot" />
             Document-grounded AI
           </span>
-          {currentUser && (
-            <>
-              <span className="user-label">{currentUser.name}</span>
-              <button
-                className="new-chat-button"
-                type="button"
-                onClick={handleUserLogout}
-              >
-                Sign out
-              </button>
-            </>
-          )}
 
           {/* Reset the current conversation when requested. */}
           <button
             className="new-chat-button"
             type="button"
-            onClick={handleNewConversation}
-            disabled={loading}
+            onClick={startNewConversation}
           >
             + New chat
+          </button>
+          <button
+            className="new-chat-button"
+            type="button"
+            onClick={handleDeleteAccount}
+          >
+            Delete account
+          </button>
+          <button
+            className="new-chat-button"
+            type="button"
+            onClick={handleLogout}
+          >
+            Sign out
           </button>
         </div>
       </header>
 
-      {/* Correct conditional rendering: show exactly one main page at a time. */}
+      {/* Conditional rendering: show exactly one main page at a time. */}
       {activeView === 'chat' ? (
-        authLoading ? (
-          <section className="auth-loading" role="status">
-            Restoring your secure session...
-          </section>
-        ) : !accessToken ? (
-          <AuthPanel onAuthenticated={handleAuthenticated} />
-        ) : (
-          <section className="chat-layout">
+        // CHAT PAGE
+        <section className="chat-layout">
           {/* Introductory panel and suggested questions. */}
           <div className="welcome-panel">
             <div className="welcome-icon" aria-hidden="true">✚</div>
@@ -571,18 +563,21 @@ export default function App() {
               </button>
             </div>
 
-            {conversations.length > 0 && (
-              <section className="conversation-history" aria-label="Conversation history">
-                <h2>Recent conversations</h2>
-                <div className="conversation-list">
-                  {conversations.map((conversation) => (
+            <section className="conversation-history" aria-label="Chat history">
+              <h2>Chat history</h2>
+              <div className="conversation-list">
+                {conversations.length === 0 ? (
+                  <p className="history-empty">Your saved chats will appear here.</p>
+                ) : (
+                  conversations.map((conversation) => (
                     <div className="conversation-history-row" key={conversation.id}>
                       <button
                         className="conversation-history-item"
                         type="button"
-                        aria-current={threadId === conversation.id ? 'page' : undefined}
-                        onClick={() => openConversation(conversation.id)}
-                        disabled={loading}
+                        title={conversation.title}
+                        aria-current={conversationId === conversation.id ? 'page' : undefined}
+                        disabled={loading || historyLoading}
+                        onClick={() => openConversation(conversation)}
                       >
                         {conversation.title}
                       </button>
@@ -590,16 +585,19 @@ export default function App() {
                         className="conversation-delete-button"
                         type="button"
                         aria-label={`Delete ${conversation.title}`}
-                        onClick={() => deleteConversation(conversation.id)}
-                        disabled={loading}
+                        title="Delete conversation"
+                        disabled={loading || historyLoading}
+                        onClick={(event) =>
+                          deleteConversation(event, conversation.id)
+                        }
                       >
-                        Delete
+                        ×
                       </button>
                     </div>
-                  ))}
-                </div>
-              </section>
-            )}
+                  ))
+                )}
+              </div>
+            </section>
           </div>
 
           {/* Main conversation panel. */}
@@ -613,7 +611,7 @@ export default function App() {
                 <small>Your questions and Medibot's answers</small>
               </div>
 
-              <span className="privacy-label">Local API</span>
+              <span className="privacy-label">Private to your account · 30-day inactivity expiry</span>
             </div>
 
             {/* Display messages, empty state, loading state, or errors. */}
@@ -657,6 +655,7 @@ export default function App() {
                   </button>
                 </div>
               )}
+              <div ref={messagesEndRef} />
             </div>
 
             {/* Question composer submits to handleSubmit(). */}
@@ -672,7 +671,7 @@ export default function App() {
                 placeholder="Ask a health-related question…"
                 rows={2}
                 maxLength={4000}
-                disabled={loading}
+                disabled={loading || historyLoading}
                 onKeyDown={(event) => {
                   // Enter sends; Shift + Enter inserts a new line.
                   if (event.key === 'Enter' && !event.shiftKey) {
@@ -683,14 +682,27 @@ export default function App() {
               />
 
               <div className="composer-footer">
-                <span>Enter to send · Shift + Enter for a new line</span>
+                <span>Saved to your account · automatically deleted after 30 days inactive</span>
 
-                <button
-                  type="submit"
-                  disabled={loading || !question.trim()}
-                >
-                  {loading ? 'Sending…' : 'Send ↑'}
-                </button>
+                {loading ? (
+                  <button
+                    className="stop-button"
+                    type="button"
+                    aria-label="Stop response and start a new conversation"
+                    title="Stop response"
+                    onClick={startNewConversation}
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M7 2.5h10L21.5 7v10L17 21.5H7L2.5 17V7z" />
+                      <rect x="8" y="8" width="8" height="8" rx="1" />
+                    </svg>
+                    Stop
+                  </button>
+                ) : (
+                  <button type="submit" disabled={!question.trim() || historyLoading}>
+                    Send ↑
+                  </button>
+                )}
               </div>
             </form>
 
@@ -701,21 +713,10 @@ export default function App() {
               For a possible emergency, seek immediate medical care.
             </p>
           </section>
-          </section>
-        )
+        </section>
       ) : (
-        adminToken ? (
-          <AdminResources
-            token={adminToken}
-            onLogout={handleAdminLogout}
-            onUnauthorized={handleAdminLogout}
-          />
-        ) : (
-          <AdminLogin
-            onLogin={handleAdminLogin}
-            onBack={openChat}
-          />
-        )
+        // ADMIN PAGE: render the resource-management component directly.
+        <AdminResources />
       )}
 
       {/* Shared footer: displayed below either page. */}

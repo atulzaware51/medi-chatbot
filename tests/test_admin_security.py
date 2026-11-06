@@ -27,16 +27,19 @@ def resource_paths(monkeypatch):
 
 @pytest.fixture
 def client(monkeypatch):
-    # Use a test-only token; never use the real admin password in tests.
-    test_token = "medibot-test-token-only"
-    monkeypatch.setenv("MEDIBOT_ADMIN_TOKEN", test_token)
     monkeypatch.delenv("MEDIBOT_ADMIN_ALLOW_REMOTE", raising=False)
+    monkeypatch.setenv("MEDIBOT_ADMIN_LOCAL_DEV", "true")
+    monkeypatch.setenv("MEDIBOT_ADMIN_PASSWORD", "test-admin-password")
+    monkeypatch.setenv(
+        "MEDIBOT_ADMIN_SESSION_SECRET",
+        "test-only-session-signing-secret-with-enough-entropy",
+    )
 
-    return TestClient(
+    test_client = TestClient(
         app,
         client=("127.0.0.1", 43120),
-        headers={"Authorization": f"Bearer {test_token}"},
     )
+    return test_client
 
 
 def install_successful_rebuild(monkeypatch, resource_paths):
@@ -361,45 +364,127 @@ def test_status_persistence_failure_rolls_back_index_swap(
 
 
 
-def test_admin_rejects_requests_without_authentication(client):
-    response = client.get(
-        "/admin/resources/",
-        headers={"Authorization": "Basic invalid"},
+def test_admin_is_directly_available_to_loopback_clients(monkeypatch):
+    monkeypatch.setenv("MEDIBOT_ADMIN_ALLOW_REMOTE", "false")
+    monkeypatch.setenv("MEDIBOT_ADMIN_LOCAL_DEV", "true")
+    monkeypatch.setenv("MEDIBOT_ADMIN_PASSWORD", "test-admin-password")
+    monkeypatch.setenv(
+        "MEDIBOT_ADMIN_SESSION_SECRET",
+        "test-only-session-signing-secret-with-enough-entropy",
     )
+    unauthenticated_client = TestClient(
+        app,
+        client=("127.0.0.1", 43120),
+    )
+
+    response = unauthenticated_client.get("/admin/resources/")
+
+    assert response.status_code == 200
+
+
+def test_admin_is_directly_available_to_loopback_without_password(monkeypatch):
+    monkeypatch.setenv("MEDIBOT_ADMIN_ALLOW_REMOTE", "false")
+    monkeypatch.setenv("MEDIBOT_ADMIN_LOCAL_DEV", "true")
+    monkeypatch.delenv("MEDIBOT_ADMIN_PASSWORD", raising=False)
+    monkeypatch.delenv("MEDIBOT_ADMIN_SESSION_SECRET", raising=False)
+    unauthenticated_client = TestClient(
+        app,
+        client=("127.0.0.1", 43120),
+    )
+
+    response = unauthenticated_client.get("/admin/resources/")
+
+    assert response.status_code == 200
+    auth_status = unauthenticated_client.get("/admin/resources/auth/status")
+    assert auth_status.json() == {
+        "configured": True,
+        "authenticated": True,
+        "login_required": False,
+    }
+
+
+def test_admin_requires_password_outside_local_dev_mode(monkeypatch):
+    monkeypatch.setenv("MEDIBOT_ADMIN_ALLOW_REMOTE", "false")
+    monkeypatch.setenv("MEDIBOT_ADMIN_LOCAL_DEV", "false")
+    monkeypatch.setenv("MEDIBOT_ADMIN_PASSWORD", "test-admin-password")
+    monkeypatch.setenv(
+        "MEDIBOT_ADMIN_SESSION_SECRET",
+        "test-only-session-signing-secret-with-enough-entropy",
+    )
+    client_without_session = TestClient(
+        app,
+        client=("127.0.0.1", 43120),
+    )
+
+    response = client_without_session.get("/admin/resources/")
 
     assert response.status_code == 401
 
 
-def test_admin_rejects_incorrect_token(client):
-    response = client.get(
-        "/admin/resources/",
-        headers={"Authorization": "Bearer incorrect-token"},
+def test_admin_login_rejects_wrong_password(client):
+    response = client.post(
+        "/admin/resources/auth/login",
+        json={"password": "incorrect-password"},
     )
 
     assert response.status_code == 401
+    assert "medibot_admin_session" not in response.headers.get("set-cookie", "")
+    assert client.get("/admin/resources/").status_code == 200
 
 
-def test_admin_returns_service_unavailable_when_token_is_not_configured(
-    client,
-    monkeypatch,
-):
-    monkeypatch.delenv("MEDIBOT_ADMIN_TOKEN", raising=False)
+def test_admin_rejects_cross_origin_state_changes(client):
+    response = client.post(
+        "/admin/resources/auth/login",
+        headers={"Origin": "https://attacker.example"},
+        json={"password": "test-admin-password"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Cross-origin admin requests are not allowed."
+
+
+def test_admin_login_issues_http_only_session_cookie(client):
+    response = client.post(
+        "/admin/resources/auth/login",
+        json={"password": "test-admin-password"},
+    )
+
+    cookie_header = response.headers["set-cookie"].lower()
+    assert response.status_code == 200
+    assert "httponly" in cookie_header
+    assert "samesite=strict" in cookie_header
+    assert "max-age=43200" in cookie_header
+
+
+def test_admin_session_cookie_is_http_only_and_logout_clears_it(client):
+    login_response = client.post(
+        "/admin/resources/auth/login",
+        json={"password": "test-admin-password"},
+    )
+    assert login_response.status_code == 200
+    assert client.cookies.get("medibot_admin_session")
+
+    response = client.post("/admin/resources/auth/logout")
+
+    assert response.status_code == 200
+    assert client.get("/admin/resources/").status_code == 200
+
+
+def test_admin_rejects_tampered_session_cookie(client):
+    client.cookies.clear()
+    client.cookies.set("medibot_admin_session", "tampered")
 
     response = client.get("/admin/resources/")
 
-    assert response.status_code == 503
-    assert response.json()["detail"] == "Admin authentication is not configured."
+    assert response.status_code == 200
 
 
 def test_admin_rejects_remote_client_by_default(resource_paths, monkeypatch):
-    test_token = "medibot-test-token-only"
-    monkeypatch.setenv("MEDIBOT_ADMIN_TOKEN", test_token)
     monkeypatch.delenv("MEDIBOT_ADMIN_ALLOW_REMOTE", raising=False)
 
     remote_client = TestClient(
         app,
         client=("203.0.113.20", 43120),
-        headers={"Authorization": f"Bearer {test_token}"},
     )
 
     response = remote_client.get("/admin/resources/")
@@ -409,27 +494,80 @@ def test_admin_rejects_remote_client_by_default(resource_paths, monkeypatch):
 
 
 def test_admin_can_explicitly_allow_remote_clients(resource_paths, monkeypatch):
-    test_token = "medibot-test-token-only"
-    monkeypatch.setenv("MEDIBOT_ADMIN_TOKEN", test_token)
     monkeypatch.setenv("MEDIBOT_ADMIN_ALLOW_REMOTE", "true")
+    monkeypatch.setenv("MEDIBOT_ADMIN_PASSWORD", "test-admin-password")
+    monkeypatch.setenv(
+        "MEDIBOT_ADMIN_SESSION_SECRET",
+        "test-only-session-signing-secret-with-enough-entropy",
+    )
 
     remote_client = TestClient(
         app,
         client=("203.0.113.20", 43120),
-        headers={"Authorization": f"Bearer {test_token}"},
     )
 
+    login_response = remote_client.post(
+        "/admin/resources/auth/login",
+        json={"password": "test-admin-password"},
+    )
     response = remote_client.get("/admin/resources/")
 
+    assert login_response.status_code == 200
     assert response.status_code == 200
     assert resource_paths[0].is_dir()
 
 
-def test_remote_client_without_token_is_rejected_before_filesystem_writes(
+def test_remote_admin_requires_a_valid_session(monkeypatch):
+    monkeypatch.setenv("MEDIBOT_ADMIN_ALLOW_REMOTE", "true")
+    monkeypatch.setenv("MEDIBOT_ADMIN_PASSWORD", "test-admin-password")
+    monkeypatch.setenv(
+        "MEDIBOT_ADMIN_SESSION_SECRET",
+        "test-only-session-signing-secret-with-enough-entropy",
+    )
+    remote_client = TestClient(
+        app,
+        client=("203.0.113.20", 43120),
+    )
+
+    auth_status = remote_client.get("/admin/resources/auth/status")
+    response = remote_client.get("/admin/resources/")
+
+    assert auth_status.json() == {
+        "configured": True,
+        "authenticated": False,
+        "login_required": True,
+    }
+    assert response.status_code == 401
+
+
+def test_remote_admin_requires_login_even_from_loopback_proxy(monkeypatch):
+    monkeypatch.setenv("MEDIBOT_ADMIN_ALLOW_REMOTE", "true")
+    monkeypatch.setenv("MEDIBOT_ADMIN_PASSWORD", "test-admin-password")
+    monkeypatch.setenv(
+        "MEDIBOT_ADMIN_SESSION_SECRET",
+        "test-only-session-signing-secret-with-enough-entropy",
+    )
+    proxy_client = TestClient(
+        app,
+        client=("127.0.0.1", 43120),
+    )
+
+    auth_status = proxy_client.get("/admin/resources/auth/status")
+    response = proxy_client.get("/admin/resources/")
+
+    assert auth_status.json() == {
+        "configured": True,
+        "authenticated": False,
+        "login_required": True,
+    }
+    assert response.status_code == 401
+
+
+def test_remote_client_is_rejected_before_filesystem_writes(
     resource_paths,
     monkeypatch,
 ):
-    monkeypatch.setenv("MEDIBOT_ADMIN_TOKEN", "medibot-test-token-only")
+    monkeypatch.delenv("MEDIBOT_ADMIN_ALLOW_REMOTE", raising=False)
 
     remote_client = TestClient(
         app,
@@ -441,7 +579,7 @@ def test_remote_client_without_token_is_rejected_before_filesystem_writes(
         files={"file": ("guide.txt", b"valid", "text/plain")},
     )
 
-    assert response.status_code == 401
+    assert response.status_code == 403
     assert not resource_paths[0].exists()
     assert not resource_paths[1].exists()
     assert not resource_paths[2].exists()

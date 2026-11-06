@@ -1,11 +1,10 @@
-
 import { useCallback, useEffect, useState } from 'react'
 
 // Vite proxies /api requests to the FastAPI backend.
 const API_URL = '/api/admin/resources/'
 const MAX_UPLOAD_SIZE = 20 * 1024 * 1024
 
-export default function AdminResources({ token, onLogout, onUnauthorized }) {
+export default function AdminResources() {
   const [resources, setResources] = useState([])
   const [indexState, setIndexState] = useState({
     status: 'not_ready',
@@ -15,17 +14,15 @@ export default function AdminResources({ token, onLogout, onUnauthorized }) {
   const [selectedFile, setSelectedFile] = useState(null)
   const [loading, setLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
+  const [authLoading, setAuthLoading] = useState(true)
+  const [authenticated, setAuthenticated] = useState(false)
+  const [loginRequired, setLoginRequired] = useState(false)
+  const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
 
   const fetchResources = useCallback(async () => {
-    const response = await fetch(API_URL, {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-    if (response.status === 401) {
-      onUnauthorized?.()
-      throw new Error('Session expired. Please sign in again.')
-    }
+    const response = await fetch(API_URL)
     const data = await response.json().catch(() => ({}))
 
     if (!response.ok) {
@@ -44,7 +41,7 @@ export default function AdminResources({ token, onLogout, onUnauthorized }) {
         message: 'Index status is unavailable.',
       },
     }
-  }, [onUnauthorized, token])
+  }, [])
 
   const loadResources = useCallback(async () => {
     setLoading(true)
@@ -68,8 +65,29 @@ export default function AdminResources({ token, onLogout, onUnauthorized }) {
   useEffect(() => {
     let active = true
 
-    fetchResources()
-      .then((data) => {
+    fetch(`${API_URL}auth/status`)
+      .then(async (response) => {
+        const data = await response.json().catch(() => ({}))
+        if (!response.ok) {
+          throw new Error(
+            typeof data.detail === 'string'
+              ? data.detail
+              : `Could not check admin login (HTTP ${response.status}).`,
+          )
+        }
+        return data
+      })
+      .then(async (auth) => {
+        if (!active) return
+        setLoginRequired(Boolean(auth.login_required))
+        if (!auth.configured) {
+          setError('Admin login is not configured on the server.')
+          return
+        }
+        if (!auth.authenticated) return
+
+        setAuthenticated(true)
+        const data = await fetchResources()
         if (!active) return
         setResources(data.resources)
         setIndexState(data.index)
@@ -83,13 +101,71 @@ export default function AdminResources({ token, onLogout, onUnauthorized }) {
         )
       })
       .finally(() => {
-        if (active) setLoading(false)
+        if (active) {
+          setLoading(false)
+          setAuthLoading(false)
+        }
       })
 
     return () => {
       active = false
     }
   }, [fetchResources])
+
+  async function handleLogin(event) {
+    event.preventDefault()
+    if (!password || authLoading) return
+
+    setAuthLoading(true)
+    setError('')
+
+    try {
+      const response = await fetch(`${API_URL}auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      })
+      const data = await response.json().catch(() => ({}))
+
+      if (!response.ok) {
+        throw new Error(
+          typeof data.detail === 'string'
+            ? data.detail
+            : `Admin login failed (HTTP ${response.status}).`,
+        )
+      }
+
+      setAuthenticated(true)
+      setPassword('')
+      await loadResources()
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Admin login failed.',
+      )
+    } finally {
+      setAuthLoading(false)
+    }
+  }
+
+  async function handleLogout() {
+    setError('')
+
+    try {
+      const response = await fetch(`${API_URL}auth/logout`, {
+        method: 'POST',
+      })
+      if (!response.ok) {
+        throw new Error(`Admin logout failed (HTTP ${response.status}).`)
+      }
+      setAuthenticated(false)
+      setResources([])
+      setPassword('')
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Admin logout failed.',
+      )
+    }
+  }
 
   async function handleUpload(event) {
     event.preventDefault()
@@ -115,6 +191,7 @@ export default function AdminResources({ token, onLogout, onUnauthorized }) {
       return
     }
 
+    // Multipart upload lets the browser send the file without encoding it as JSON.
     const formData = new FormData()
     formData.append('file', selectedFile)
 
@@ -125,16 +202,10 @@ export default function AdminResources({ token, onLogout, onUnauthorized }) {
     try {
       const response = await fetch(`${API_URL}upload`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
         body: formData,
       })
 
       const data = await response.json().catch(() => ({}))
-
-      if (response.status === 401) {
-        onUnauthorized?.()
-        throw new Error('Session expired. Please sign in again.')
-      }
 
       if (!response.ok) {
         throw new Error(
@@ -165,7 +236,7 @@ export default function AdminResources({ token, onLogout, onUnauthorized }) {
       const input = event.currentTarget.querySelector('input[type="file"]')
       if (input) input.value = ''
 
-      // Reload persistent statuses and chunk counts from the backend.
+      // Reload persisted indexing status and per-resource chunk counts after the rebuild.
       await loadResources()
     } catch (err) {
       setNotice('')
@@ -193,6 +264,43 @@ export default function AdminResources({ token, onLogout, onUnauthorized }) {
   const indexStatusLabel =
     indexStatusLabels[indexState.status] ?? 'Unavailable'
 
+  if (authLoading) {
+    return (
+      <section className="admin-login-page" role="status">
+        Checking admin session...
+      </section>
+    )
+  }
+
+  if (!authenticated) {
+    return (
+      <section className="admin-login-page">
+        <form className="admin-login-card" onSubmit={handleLogin}>
+          <p className="eyebrow">RESTRICTED AREA</p>
+          <h1>Admin sign in</h1>
+          <p>Enter the administrator password to manage knowledge resources.</p>
+
+          <label htmlFor="admin-password">Password</label>
+          <input
+            id="admin-password"
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            required
+            disabled={authLoading}
+          />
+
+          {error && <div className="error-message" role="alert">{error}</div>}
+
+          <button type="submit" disabled={!password || authLoading}>
+            {authLoading ? 'Signing in...' : 'Sign in'}
+          </button>
+        </form>
+      </section>
+    )
+  }
+
   return (
     <section className="admin-page">
       <header className="admin-heading">
@@ -204,10 +312,6 @@ export default function AdminResources({ token, onLogout, onUnauthorized }) {
           </p>
         </div>
 
-        <div className="admin-actions">
-        <button type="button" className="new-chat-button" onClick={onLogout}>
-          Logout
-        </button>
         <button
           className="new-chat-button"
           type="button"
@@ -216,7 +320,16 @@ export default function AdminResources({ token, onLogout, onUnauthorized }) {
         >
           {loading ? 'Refreshing...' : 'Refresh list'}
         </button>
-        </div>
+        {loginRequired && (
+          <button
+            className="new-chat-button"
+            type="button"
+            onClick={handleLogout}
+            disabled={uploading}
+          >
+            Log out
+          </button>
+        )}
       </header>
 
       <div className="admin-notice">

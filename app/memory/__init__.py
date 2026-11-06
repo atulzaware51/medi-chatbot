@@ -1,1 +1,1 @@
-"""Persistent conversation memory for Medibot."""
+"""Conversation history is persisted with owner-scoped application records."""

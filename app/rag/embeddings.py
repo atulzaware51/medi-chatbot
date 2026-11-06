@@ -18,6 +18,7 @@ def get_embeddings() -> HuggingFaceEmbeddings:
         "sentence-transformers/all-MiniLM-L6-v2",
     )
 
+    # Keep vector creation local on CPU and normalize vectors for consistent similarity scoring.
     return HuggingFaceEmbeddings(
         model_name=model_name,
         model_kwargs={"device": "cpu"},

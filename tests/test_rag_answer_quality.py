@@ -50,6 +50,38 @@ def test_emergency_questions_return_immediate_guidance(monkeypatch, question):
     assert "now" in result["answer"].lower()
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Do I have osteoporosis?",
+        "What is causing these symptoms?",
+        "Should I stop my medication?",
+        "What dose should I take?",
+        "Can I combine these medicines?",
+    ],
+)
+def test_personal_diagnosis_and_medication_decisions_are_not_generated(
+    monkeypatch,
+    question,
+):
+    monkeypatch.setattr(
+        service,
+        "search_knowledge_base",
+        lambda *a, **kw: pytest.fail("A personal treatment decision must not be generated"),
+    )
+    monkeypatch.setattr(
+        service,
+        "get_llm",
+        lambda: pytest.fail("A personal treatment decision must not call the LLM"),
+    )
+
+    result = service.ask_medibot(question)
+
+    assert result["sources"] == []
+    assert "can't diagnose" in result["answer"]
+    assert "pharmacist" in result["answer"]
+
+
 def test_source_labels_match_returned_source_references(monkeypatch):
     monkeypatch.setattr(
         service,
@@ -198,4 +230,3 @@ def test_clean_answer_preserves_valid_unicode_and_citations(text):
 def test_clean_answer_normalizes_unicode_whitespace():
     text = "Bone\u00a0health\u202fis important.\ufeff"
     assert service._clean_answer_text(text) == "Bone health is important."
-

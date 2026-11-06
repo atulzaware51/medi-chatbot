@@ -27,6 +27,8 @@ def split_documents(
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
+        # len() makes these limits character counts; prefer paragraph/sentence
+        # boundaries before falling back to spaces or individual characters.
         length_function=len,
         separators=["\n\n", "\n", ". ", " ", ""],
         add_start_index=True,
@@ -44,6 +46,7 @@ def split_documents(
         source = str(chunk.metadata.get("source", "unknown"))
         page = chunk.metadata.get("page", "na")
 
+        # Keep source, page, and batch position with each passage for traceable citations.
         chunk.metadata["chunk_index"] = index
         chunk.metadata["chunk_id"] = (
             f"{source}:page-{page}:chunk-{index}"

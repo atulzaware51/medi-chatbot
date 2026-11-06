@@ -13,6 +13,8 @@ load_dotenv(ROOT / ".env", override=False)
 @lru_cache(maxsize=1)
 def get_llm():
     """Create and cache the configured Groq chat model."""
+    # Fail explicitly for missing or unsupported configuration instead of silently
+    # returning an unconfigured model to the answer-generation path.
     provider = os.getenv("LLM_PROVIDER", "groq").strip().lower()
 
     if provider != "groq":
@@ -30,6 +32,7 @@ def get_llm():
     if not model:
         raise ValueError("GROQ_MODEL is missing from the .env configuration.")
 
+    # Reuse a deterministic, bounded-retry client for all answers in this process.
     return ChatGroq(
         model=model,
         api_key=api_key,

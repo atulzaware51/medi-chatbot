@@ -43,6 +43,7 @@ def load_document(file_path: str | Path) -> list[Document]:
             continue
 
         document.page_content = text
+        # Store a filename (not an absolute path) so later citations identify the source safely.
         document.metadata["source"] = path.name
         cleaned_documents.append(document)
 

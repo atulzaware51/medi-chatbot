@@ -27,6 +27,7 @@ def create_vector_store(
         embedding=get_embeddings(),
     )
 
+    # Persist both the vector index and its document metadata for later retrieval.
     vector_store.save_local(str(path))
 
     print(f"[SAVED] FAISS index: {path.resolve()}")
@@ -52,8 +53,7 @@ def load_vector_store(
             f"FAISS metadata file not found at {path}."
         )
 
-    # Only load indexes that you generated and trust locally.
-    # FAISS's metadata file uses pickle deserialization.
+    # FAISS metadata uses pickle; only load indexes generated and trusted locally.
     return FAISS.load_local(
         str(path),
         get_embeddings(),

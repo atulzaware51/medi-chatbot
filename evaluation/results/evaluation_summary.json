@@ -1,0 +1,14 @@
+﻿{
+    "evaluation_date":  "2026-11-03 16:43:28",
+    "total_tests":  20,
+    "successful_requests":  20,
+    "failed_requests":  0,
+    "api_success_rate_percent":  100,
+    "nonempty_answers":  20,
+    "answers_with_sources":  14,
+    "source_coverage_percent":  70,
+    "average_latency_ms":  13139.65,
+    "median_latency_ms":  14626.5,
+    "p95_latency_ms":  21395,
+    "note":  "API metrics only. Relevance, faithfulness, correctness and medical safety require evidence-based review."
+}
